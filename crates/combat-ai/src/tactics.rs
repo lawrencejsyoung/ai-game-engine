@@ -339,7 +339,7 @@ pub(crate) fn find_attack_position(
         })
 }
 
-/// Random reachable point around `home`.
+/// Random reachable point around `home` (the patrol center).
 pub(crate) fn find_patrol_point(
     sh: &Shared,
     from: Vec3,
@@ -347,10 +347,12 @@ pub(crate) fn find_patrol_point(
     radius: f32,
     rng: &mut Rng,
 ) -> Option<Vec3> {
+    // The center may be far away (hunting around a distant last contact).
+    let max_path = from.distance(home) * 2.0 + radius * 4.0;
     for _ in 0..4 {
         let o = rng.unit_disk() * radius;
         let p = home + Vec3::new(o.x, 0.0, o.y);
-        if reachable(sh, from, p, radius * 4.0) {
+        if reachable(sh, from, p, max_path) {
             return Some(p);
         }
     }

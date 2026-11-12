@@ -108,16 +108,27 @@ impl Archetype {
                     Consideration::new(TimeSinceTargetSeen, Curve::Logistic { k: -12.0, mid: 0.6 }),
                 ],
                 Bt::selector([
+                    // In cover: duck, top up if low, then pop up and return fire
+                    // for a moment before ducking again. Pure hiding lets two
+                    // cautious agents stare at walls forever.
                     Bt::sequence([
                         Bt::cond(C::InCover),
                         Bt::task(T::SetStance(Stance::Crouch)),
+                        Bt::task(T::Watch),
                         Bt::selector([
                             Bt::sequence([
                                 Bt::cond(C::AmmoBelow(0.6)),
                                 Bt::task(T::Bark(Bark::Reloading)),
                                 Bt::task(T::Reload),
                             ]),
-                            Bt::wait(1.0),
+                            Bt::sequence([
+                                Bt::wait(1.0),
+                                Bt::task(T::SetStance(Stance::Stand)),
+                                Bt::wait(0.35),
+                                Bt::task(T::ShootTarget).timeout(2.5).optional(),
+                                Bt::task(T::Watch),
+                                Bt::task(T::SetStance(Stance::Crouch)),
+                            ]),
                         ]),
                     ]),
                     // Relocating has a cooldown so an agent whose cover gets
@@ -160,7 +171,13 @@ impl Archetype {
                     Consideration::require(HasTarget),
                     Consideration::require(RoleSuppressor),
                     step(TargetVisible, 1.0, 0.5),
-                    Consideration::new(TimeSinceTargetSeen, Curve::Logistic { k: -15.0, mid: 0.4 }),
+                    Consideration::new(
+                        TimeSinceTargetSeen,
+                        Curve::Logistic {
+                            k: -20.0,
+                            mid: 0.25,
+                        },
+                    ),
                     lin(Ammo, 0.5, 0.5),
                 ],
                 Bt::selector([
@@ -205,6 +222,9 @@ impl Archetype {
                     lin(Courage, -0.8, 1.0),
                     lin(ThreatCount, 0.5, 0.5),
                     step(InCover, 1.0, 0.5),
+                    // Once the threat has been out of sight for a while, stop
+                    // running and go back to fighting (or hunting).
+                    Consideration::new(TimeSinceTargetSeen, Curve::Logistic { k: -10.0, mid: 0.8 }),
                 ],
                 Bt::sequence([
                     Bt::task(T::FindRetreatPosition),
@@ -264,7 +284,8 @@ impl Archetype {
         let config = AgentConfig {
             view_range: 45.0,
             preferred_range: (3.0, 12.0),
-            accuracy_deg: 3.0,
+            accuracy_deg: 2.2,
+            aim_settle_time: 0.7,
             fire_interval: 0.08,
             burst_length: 6,
             burst_pause: (0.25, 0.5),

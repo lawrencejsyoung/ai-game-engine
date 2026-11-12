@@ -5,7 +5,10 @@
 //! health, ammo and pathing, feeds state/stimuli to the AI, and applies the
 //! commands it gets back.
 //!
-//! Usage: `cargo run -p arena-demo --release -- [--seed N] [--per-team N] [--quiet] [--swap-sides]`
+//! Usage: `cargo run -p arena-demo --release -- [--seed N] [--per-team N] [--quiet] [--swap-sides] [--batch N]`
+//!
+//! `--batch N` plays N matches (seeds `seed..seed+N`, alternating sides) and
+//! prints aggregate statistics instead of a single match log.
 
 mod map;
 
@@ -17,6 +20,35 @@ use std::sync::Arc;
 
 const DT: f32 = 1.0 / 60.0;
 const MAX_TIME: f32 = 240.0;
+/// Radius of the body capsule used for hit tests.
+const HITBOX_RADIUS: f32 = 0.3;
+
+/// Closest approach between the ray `origin + t * dir` (`t >= 0`, `dir`
+/// normalized) and the segment `a..b`. Returns `(t, distance)`, or `None` if
+/// the closest point is behind the origin.
+fn ray_segment(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3) -> Option<(f32, f32)> {
+    let u = b - a;
+    let w = origin - a;
+    let (uu, ud) = (u.dot(u), u.dot(dir));
+    let (uw, dw) = (u.dot(w), dir.dot(w));
+    let denom = uu - ud * ud;
+    // Parameter along the segment, clamped to it.
+    let mut s = if denom > 1e-6 {
+        (uw - ud * dw) / denom
+    } else {
+        0.0
+    };
+    s = s.clamp(0.0, 1.0);
+    let p = a + u * s;
+    let t = (p - origin).dot(dir);
+    if t <= 0.0 {
+        return None;
+    }
+    // Re-project onto the segment for the final distance.
+    let q = origin + dir * t;
+    let s2 = ((q - a).dot(u) / uu.max(1e-6)).clamp(0.0, 1.0);
+    Some((t, q.distance(a + u * s2)))
+}
 
 struct Weapon {
     damage: f32,
@@ -34,6 +66,9 @@ struct Body {
     reload_left: f32,
     shots: u32,
     hits: u32,
+    /// Shots fired at a tracked, visible target (excludes suppressive fire).
+    aimed_shots: u32,
+    aimed_hits: u32,
     kills: u32,
 }
 
@@ -45,13 +80,137 @@ fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Shot counters.
+#[derive(Copy, Clone, Default)]
+struct Accuracy {
+    shots: u32,
+    hits: u32,
+    aimed_shots: u32,
+    aimed_hits: u32,
+}
+
+impl Accuracy {
+    fn add(&mut self, o: Accuracy) {
+        self.shots += o.shots;
+        self.hits += o.hits;
+        self.aimed_shots += o.aimed_shots;
+        self.aimed_hits += o.aimed_hits;
+    }
+}
+
+fn pct(n: u32, d: u32) -> f32 {
+    100.0 * n as f32 / d.max(1) as f32
+}
+
+/// Outcome of one match.
+struct MatchResult {
+    /// Winning team (0 = UPPER, 1 = lower), `None` for a draw.
+    winner: Option<u16>,
+    /// Match length in seconds.
+    time: f32,
+    /// Ended because the time cap was reached.
+    timed_out: bool,
+    /// Per archetype: shot counts.
+    accuracy: HashMap<&'static str, Accuracy>,
+    /// Survivors per team at the end.
+    alive: [usize; 2],
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let seed: u64 = arg(&args, "--seed", 7);
     let per_team: usize = arg(&args, "--per-team", 6);
     let quiet = args.iter().any(|a| a == "--quiet");
     let swap = args.iter().any(|a| a == "--swap-sides");
+    let batch: u64 = arg(&args, "--batch", 0);
 
+    if batch == 0 {
+        run_match(
+            seed,
+            per_team,
+            swap,
+            if quiet {
+                Verbosity::Summary
+            } else {
+                Verbosity::Full
+            },
+        );
+        return;
+    }
+
+    let mut wins = [0u32; 2];
+    let mut draws = 0;
+    let mut timeouts = 0;
+    let mut total_time = 0.0;
+    let mut acc: HashMap<&'static str, Accuracy> = HashMap::new();
+    for i in 0..batch {
+        let s = seed + i;
+        let sw = swap ^ (i % 2 == 1);
+        let r = run_match(s, per_team, sw, Verbosity::Silent);
+        match r.winner {
+            Some(t) => wins[t as usize] += 1,
+            None => draws += 1,
+        }
+        timeouts += r.timed_out as u32;
+        total_time += r.time;
+        for (k, a) in r.accuracy {
+            acc.entry(k).or_default().add(a);
+        }
+        println!(
+            "seed {s:>4} {:<5} {:>6.1}s  {:<10} survivors {}v{}",
+            if sw { "swap" } else { "" },
+            r.time,
+            match (r.winner, r.timed_out) {
+                (_, true) => "TIMEOUT".to_string(),
+                (Some(0), _) => "UPPER".to_string(),
+                (Some(_), _) => "lower".to_string(),
+                (None, _) => "draw".to_string(),
+            },
+            r.alive[0],
+            r.alive[1]
+        );
+    }
+    println!(
+        "\n{batch} matches: UPPER {} / lower {} / draw {draws} | {timeouts} hit the {MAX_TIME:.0}s cap ({:.0}%) | avg length {:.1}s",
+        wins[0],
+        wins[1],
+        100.0 * timeouts as f32 / batch as f32,
+        total_time / batch as f32
+    );
+    let mut acc: Vec<_> = acc.into_iter().collect();
+    acc.sort_by_key(|a| a.0);
+    let mut total = Accuracy::default();
+    println!(
+        "\n{:<10}{:>9}{:>9}{:>12}{:>12}",
+        "type", "shots", "hit %", "aimed %", "suppress %"
+    );
+    for (k, a) in &acc {
+        total.add(*a);
+        print_accuracy(k, a);
+    }
+    print_accuracy("overall", &total);
+}
+
+fn print_accuracy(name: &str, a: &Accuracy) {
+    println!(
+        "{:<10}{:>9}{:>8.1}%{:>11.1}%{:>11.1}%",
+        name,
+        a.shots,
+        pct(a.hits, a.shots),
+        pct(a.aimed_hits, a.aimed_shots),
+        pct(a.shots - a.aimed_shots, a.shots)
+    );
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Verbosity {
+    Silent,
+    Summary,
+    Full,
+}
+
+fn run_match(seed: u64, per_team: usize, swap: bool, verbosity: Verbosity) -> MatchResult {
+    let quiet = verbosity < Verbosity::Full;
     let map = Map::parse(LAYOUT);
     let mut ai = AiSystem::new(SystemConfig {
         seed,
@@ -95,20 +254,30 @@ fn main() {
     };
     let mut bodies: Vec<Body> = Vec::new();
     let mut rng = combat_ai::math::Rng::new(seed);
+    // Spawn cells are drawn first, in a fixed order, so the order agents are
+    // registered in can't change where anyone starts.
+    let mut cells = [Vec::new(), Vec::new()];
+    for (team, cells) in cells.iter_mut().enumerate() {
+        let left = (team == 0) != swap;
+        for _ in 0..per_team {
+            loop {
+                // Column 3..=6 from the team's own wall, mirrored for the right side.
+                let col = 3 + (rng.f32() * 4.0) as i32;
+                let cx = if left { col } else { map.w - 1 - col };
+                let cz = 2 + (rng.f32() * (map.h - 4) as f32) as i32;
+                if map.walkable(cx, cz) {
+                    cells.push((cx, cz));
+                    break;
+                }
+            }
+        }
+    }
     for team in 0..2u16 {
         let squads = [ai.create_squad(), ai.create_squad()];
         for i in 0..per_team {
             let (name, arch, w) = &roster[pick(i)];
             let left = (team == 0) != swap;
-            let x = if left { 4 } else { map.w - 5 };
-            let (mut cx, mut cz);
-            loop {
-                cx = x + rng.range(-2.0, 3.0) as i32;
-                cz = 2 + (rng.f32() * (map.h - 4) as f32) as i32;
-                if map.walkable(cx, cz) {
-                    break;
-                }
-            }
+            let (cx, cz) = cells[team as usize][i];
             let facing = if left { Vec3::X } else { -Vec3::X };
             let mut state = ActorState::new(Map::center(cx, cz), TeamId(team)).facing(facing);
             state.mag_size = match *name {
@@ -138,6 +307,8 @@ fn main() {
                 reload_left: 0.0,
                 shots: 0,
                 hits: 0,
+                aimed_shots: 0,
+                aimed_hits: 0,
                 kills: 0,
             });
         }
@@ -146,13 +317,15 @@ fn main() {
     let index_of: HashMap<ActorId, usize> =
         bodies.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
 
-    println!(
-        "arena: {}x{} m, {} cover points, {} agents per team, seed {seed}",
-        map.w as f32 * CELL,
-        map.h as f32 * CELL,
-        ai.cover_points().len(),
-        per_team
-    );
+    if verbosity > Verbosity::Silent {
+        println!(
+            "arena: {}x{} m, {} cover points, {} agents per team, seed {seed}",
+            map.w as f32 * CELL,
+            map.h as f32 * CELL,
+            ai.cover_points().len(),
+            per_team
+        );
+    }
 
     let mut time = 0.0f32;
     let mut frame = 0u64;
@@ -201,6 +374,7 @@ fn main() {
             .collect();
         let mut damage_events = Vec::new();
         let mut impact_sounds = Vec::new();
+        let mut footsteps = Vec::new();
         for cmd in &commands {
             let bi = index_of[&cmd.actor];
             *action_time.entry(cmd.action).or_default() += DT;
@@ -279,20 +453,27 @@ fn main() {
                     if !o.is_alive() {
                         continue;
                     }
-                    let c = o.chest();
-                    let t = (c - eye).dot(cmd.aim_dir);
-                    if t <= 0.0 || t > 150.0 {
+                    // Body hitbox: a capsule from the shins to the top of the head.
+                    let base = o.position + Vec3::Y * 0.15;
+                    let top = o.eye() + Vec3::Y * 0.15;
+                    let Some((t, miss)) = ray_segment(eye, cmd.aim_dir, base, top) else {
+                        continue;
+                    };
+                    if t > 150.0 {
                         continue;
                     }
-                    let closest = eye + cmd.aim_dir * t;
-                    let miss = closest.distance(c);
-                    if miss < 0.45 && map.line_of_sight(eye, closest) {
+                    let point = eye + cmd.aim_dir * t;
+                    if miss < HITBOX_RADIUS && map.line_of_sight(eye, point) {
                         if best.is_none_or(|(bt, _)| t < bt) {
                             best = Some((t, oid));
                         }
                     } else if miss < 2.5 && near_miss.is_none_or(|(m, _, _)| miss < m) {
-                        near_miss = Some((miss, closest, oid));
+                        near_miss = Some((miss, point, oid));
                     }
+                }
+                if cmd.aim_target.is_some() {
+                    body.aimed_shots += 1;
+                    body.aimed_hits += best.is_some() as u32;
                 }
                 if let Some((_, victim)) = best {
                     body.hits += 1;
@@ -300,6 +481,17 @@ fn main() {
                 } else if let Some((_, p, _)) = near_miss {
                     impact_sounds.push((p, cmd.actor));
                 }
+            }
+
+            // Footsteps: running and sprinting are audible, walking is quiet.
+            let step_radius = match cmd.move_speed {
+                _ if vel == Vec3::ZERO => 0.0,
+                MoveSpeed::Walk => 0.0,
+                MoveSpeed::Run => 10.0,
+                MoveSpeed::Sprint => 16.0,
+            };
+            if step_radius > 0.0 && frame % 20 == bi as u64 % 20 {
+                footsteps.push((pos, cmd.actor, step_radius));
             }
 
             let st = ai.actor_state_mut(cmd.actor).unwrap();
@@ -339,6 +531,14 @@ fn main() {
                 }
             }
         }
+        for (position, source, radius) in footsteps {
+            ai.report_sound(SoundEvent {
+                position,
+                radius,
+                source: Some(source),
+                kind: SoundKind::Movement,
+            });
+        }
         for (p, shooter) in impact_sounds {
             ai.report_sound(SoundEvent {
                 position: p,
@@ -370,6 +570,32 @@ fn main() {
         }
     };
 
+    let alive = |team: u16| {
+        bodies
+            .iter()
+            .filter(|b| b.team == team && ai.actor_state(b.id).unwrap().is_alive())
+            .count()
+    };
+    let mut accuracy: HashMap<&'static str, Accuracy> = HashMap::new();
+    for b in &bodies {
+        accuracy.entry(b.archetype).or_default().add(Accuracy {
+            shots: b.shots,
+            hits: b.hits,
+            aimed_shots: b.aimed_shots,
+            aimed_hits: b.aimed_hits,
+        });
+    }
+    let result = MatchResult {
+        winner,
+        time,
+        timed_out: time >= MAX_TIME,
+        accuracy,
+        alive: [alive(0), alive(1)],
+    };
+    if verbosity == Verbosity::Silent {
+        return result;
+    }
+
     print_snapshot(&map, &ai, &bodies, time);
     println!("\n=== result after {time:.1}s ===");
     match winner {
@@ -392,6 +618,15 @@ fn main() {
             b.kills
         );
     }
+    let mut acc: Vec<_> = result.accuracy.iter().collect();
+    acc.sort_by_key(|a| *a.0);
+    println!(
+        "\n{:<10}{:>9}{:>9}{:>12}{:>12}",
+        "type", "shots", "hit %", "aimed %", "suppress %"
+    );
+    for (k, a) in acc {
+        print_accuracy(k, a);
+    }
     let mut actions: Vec<_> = action_time.into_iter().collect();
     actions.sort_by(|a, b| b.1.total_cmp(&a.1));
     println!("\naction time share (agent-seconds):");
@@ -408,6 +643,7 @@ fn main() {
         total_paths as f64 / frame as f64,
         barks
     );
+    result
 }
 
 fn print_snapshot(map: &Map, ai: &AiSystem, bodies: &[Body], time: f32) {

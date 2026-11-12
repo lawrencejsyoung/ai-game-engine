@@ -20,6 +20,8 @@ pub(crate) fn act(b: &mut Brain, me: &ActorState, sh: &Shared) {
     // --- where to look ---
     let look_point = match intent.look {
         LookMode::Target => match (live, tmem) {
+            // Aim at whatever part of the body is actually exposed.
+            (Some(a), Some(m)) if m.head_only => Some(a.eye()),
             (Some(a), _) => Some(a.chest()),
             (None, Some(m)) => Some(m.last_known_pos + Vec3::Y * 1.2),
             _ => None,
@@ -59,17 +61,25 @@ pub(crate) fn act(b: &mut Brain, me: &ActorState, sh: &Shared) {
     let has_token = !token_limited || (b.token.is_some() && b.token == b.target);
 
     // --- fire decision with bursts ---
+    let range = cfg.effective_range(sh.config.target_radius) / sh.config.accuracy_scale.max(1e-3);
+    let in_range = |a: &ActorState| a.position.distance_squared(me.position) <= range * range;
     let wants_fire = match intent.fire {
         FireMode::Hold => false,
-        FireMode::Target => live.is_some() && now >= b.reaction_ready,
-        FireMode::Point(_) => true,
+        FireMode::Target => live.is_some_and(in_range) && now >= b.reaction_ready,
+        // Suppression doesn't need to hit, but there's no point beyond the weapon's reach.
+        FireMode::Point(p) => p.distance_squared(eye) <= (range * 1.5) * (range * 1.5),
     } && me.ammo > 0
         && !intent.reload;
     let mut fire = false;
     if wants_fire && now >= b.aim.next_shot {
         fire = true;
         b.aim.shots_in_burst += 1;
-        b.aim.next_shot = now + cfg.fire_interval;
+        let interval = if matches!(intent.fire, FireMode::Point(_)) {
+            cfg.fire_interval.max(1.0 / cfg.suppression_rate.max(0.01))
+        } else {
+            cfg.fire_interval
+        };
+        b.aim.next_shot = now + interval;
         if b.aim.shots_in_burst >= cfg.burst_length.max(1) {
             b.aim.shots_in_burst = 0;
             b.aim.next_shot = now + b.rng.range(cfg.burst_pause.0, cfg.burst_pause.1);
@@ -85,11 +95,13 @@ pub(crate) fn act(b: &mut Brain, me: &ActorState, sh: &Shared) {
             let to = p - eye;
             let dist = to.length().max(0.01);
             let dir = to / dist;
-            let mut spread = cfg.accuracy_deg * (1.0 + 1.5 * (1.0 - b.aim.settle));
-            if let Some(a) = live {
-                spread += a.velocity.length() * 0.12;
-            }
-            spread += b.under_fire * 0.75;
+            let target_speed = live.map_or(0.0, |a| a.velocity.length());
+            let mut spread = cfg.spread_deg(
+                b.aim.settle,
+                target_speed,
+                me.velocity.length(),
+                b.under_fire,
+            ) * sh.config.accuracy_scale.max(0.0);
             if matches!(intent.fire, FireMode::Point(_)) {
                 spread += 2.5;
             } else if !has_token {
@@ -119,6 +131,10 @@ pub(crate) fn act(b: &mut Brain, me: &ActorState, sh: &Shared) {
         move_speed: intent.speed,
         aim_dir,
         aim_point,
+        aim_target: match (intent.look, intent.fire, live) {
+            (LookMode::Target, FireMode::Hold | FireMode::Target, Some(_)) => b.target,
+            _ => None,
+        },
         fire,
         reload: intent.reload && me.ammo < me.mag_size,
         stance: intent.stance,

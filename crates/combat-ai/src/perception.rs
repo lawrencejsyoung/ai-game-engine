@@ -27,7 +27,6 @@ pub(crate) fn perceive(b: &mut Brain, me: &ActorState, sh: &Shared) {
     } else {
         cfg.think_interval
     };
-    let since = b.last_perception;
     let eye = me.eye();
     let fwd = flat_dir(me.forward, Vec3::Z);
     let cos_central = (cfg.fov_deg.to_radians() * 0.5).cos();
@@ -110,7 +109,9 @@ pub(crate) fn perceive(b: &mut Brain, me: &ActorState, sh: &Shared) {
         let Some(target) = sh.actor(c.id) else {
             continue;
         };
-        let visible = sh.los(eye, target.chest()) || sh.los(eye, target.eye());
+        // Chest first; if that is blocked (e.g. crouched behind low cover) the head may still show.
+        let chest = sh.los(eye, target.chest());
+        let visible = chest || sh.los(eye, target.eye());
         if !visible {
             if let Some(m) = b.memory.get_mut(c.id) {
                 m.visible = false;
@@ -145,6 +146,7 @@ pub(crate) fn perceive(b: &mut Brain, me: &ActorState, sh: &Shared) {
             m.awareness = 1.0;
         }
         m.visible = true;
+        m.head_only = !chest;
         m.los_checked = now;
         m.last_known_pos = target.position;
         m.last_known_vel = target.velocity;
@@ -172,7 +174,9 @@ pub(crate) fn perceive(b: &mut Brain, me: &ActorState, sh: &Shared) {
     }
 
     // --- hearing ---
-    for s in sh.sounds.iter().filter(|s| s.time > since && s.time <= now) {
+    let heard_before = b.heard_seq;
+    for s in sh.sounds.iter().filter(|s| s.seq > heard_before) {
+        b.heard_seq = b.heard_seq.max(s.seq);
         let ev = &s.event;
         let r = ev.radius * cfg.hearing;
         let d = ev.position.distance(me.position);
@@ -246,6 +250,7 @@ pub(crate) fn perceive(b: &mut Brain, me: &ActorState, sh: &Shared) {
     let damage = std::mem::take(&mut b.pending_damage);
     for dmg in &damage {
         b.under_fire = 1.0;
+        b.calm_time = 0.0;
         let Some(att) = dmg.attacker else {
             b.investigate.get_or_insert(dmg.origin);
             continue;
@@ -310,6 +315,42 @@ pub(crate) fn perceive(b: &mut Brain, me: &ActorState, sh: &Shared) {
         }
     }
 
+    // --- host intel (AiSystem::reveal) ---
+    let intel = std::mem::take(&mut b.pending_intel);
+    for &(target, pos, vel) in &intel {
+        if sh
+            .actor(target)
+            .is_none_or(|a| !a.is_alive() || a.team == me.team)
+        {
+            continue;
+        }
+        let Some(m) = b.memory.entry(
+            target,
+            pos,
+            now,
+            Source::Squad,
+            cap,
+            2.5,
+            me.position,
+            current,
+        ) else {
+            continue;
+        };
+        if !m.confirmed() {
+            newly_confirmed = true;
+        }
+        m.awareness = 1.0;
+        if !m.visible {
+            m.last_known_pos = pos;
+            m.last_known_vel = vel;
+            m.last_update = now;
+            m.searched = false;
+            m.source = Source::Squad;
+        }
+    }
+    b.pending_intel = intel;
+    b.pending_intel.clear();
+
     // --- forget the dead and the stale ---
     b.memory
         .entries
@@ -317,7 +358,22 @@ pub(crate) fn perceive(b: &mut Brain, me: &ActorState, sh: &Shared) {
     b.memory.decay(now, dt, cfg.memory_span);
     b.under_fire = (b.under_fire - dt * 0.35).max(0.0);
     if b.memory.confirmed_count() > 0 {
+        b.calm_time += dt;
+    }
+    if b.memory.confirmed_count() > 0 {
         b.investigate = None;
+    }
+    // Remember the freshest contact even after the memory itself is forgotten (hunting).
+    if let Some(e) = b
+        .memory
+        .entries
+        .iter()
+        .filter(|e| e.confirmed())
+        .max_by(|x, y| x.last_update.total_cmp(&y.last_update))
+    {
+        if b.last_contact.is_none_or(|(_, t)| e.last_update >= t) {
+            b.last_contact = Some((e.last_known_pos, e.last_update));
+        }
     }
     if newly_confirmed {
         b.bark(now, Bark::EnemySpotted);

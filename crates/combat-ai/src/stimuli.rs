@@ -46,4 +46,7 @@ pub struct DamageEvent {
 pub(crate) struct TimedSound {
     pub event: SoundEvent,
     pub time: f32,
+    /// Monotonic sequence number: agents hear each sound exactly once, even
+    /// when it is reported between ticks with the previous tick's timestamp.
+    pub seq: u64,
 }

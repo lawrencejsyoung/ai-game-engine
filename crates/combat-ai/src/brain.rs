@@ -5,7 +5,7 @@ use crate::archetype::Archetype;
 use crate::bt::{NodeId, NodeMem, Status};
 use crate::command::{AgentCommand, Bark, MoveSpeed};
 use crate::ids::{ActorId, CoverId, SquadId};
-use crate::math::{band, dist2_xz, Rng};
+use crate::math::{band, dist2_xz, mix64, Rng};
 use crate::memory::Memory;
 use crate::spatial::SpatialGrid;
 use crate::squad::{Squad, SquadRole};
@@ -132,12 +132,20 @@ pub(crate) struct Brain {
     // perception
     pub memory: Memory,
     pub last_perception: f32,
+    /// Highest sound sequence number already heard.
+    pub heard_seq: u64,
     pub next_think: f32,
     pub think_interval: f32,
     pub pending_damage: SmallVec<[DamageEvent; 4]>,
     pub wake: bool,
     pub under_fire: f32,
     pub investigate: Option<Vec3>,
+    /// Host-provided intel ([`crate::AiSystem::reveal`]): target, position, velocity.
+    pub pending_intel: SmallVec<[(ActorId, Vec3, Vec3); 2]>,
+    /// Where and when a confirmed enemy was last known to be (survives forgetting).
+    pub last_contact: Option<(Vec3, f32)>,
+    /// Seconds spent with a target but without exchanging damage (impatience).
+    pub calm_time: f32,
 
     // decision
     pub target: Option<ActorId>,
@@ -170,7 +178,12 @@ pub(crate) struct Brain {
 
 impl Brain {
     pub fn new(actor: ActorId, archetype: Arc<Archetype>, state: &ActorState, seed: u64) -> Self {
-        let mut rng = Rng::new(seed ^ ((actor.index as u64) << 32 | actor.generation as u64));
+        // Hash seed and handle together: a plain `seed ^ index` would give agent 0
+        // exactly the stream a host gets from `Rng::new(seed)`, correlating the
+        // AI's dice with the host's (e.g. spawn placement).
+        let mut rng = Rng::new(mix64(
+            mix64(seed) ^ ((actor.index as u64) << 32 | actor.generation as u64),
+        ));
         let interval = archetype.config.think_interval;
         let n_actions = archetype.actions.len();
         // Stagger first thinks so agents spawned together don't all think on one frame.
@@ -181,12 +194,16 @@ impl Brain {
             home: state.position,
             memory: Memory::default(),
             last_perception: f32::NEG_INFINITY,
+            heard_seq: 0,
             next_think: first_think,
             think_interval: interval,
             pending_damage: SmallVec::new(),
             wake: false,
             under_fire: 0.0,
             investigate: None,
+            pending_intel: SmallVec::new(),
+            last_contact: None,
+            calm_time: 0.0,
             target: None,
             reaction_ready: 0.0,
             current_action: None,
@@ -221,6 +238,26 @@ impl Brain {
         }
     }
 
+    /// Stand-off frustration in `[0, 1]`.
+    pub fn impatience(&self) -> f32 {
+        let p = self.archetype.config.patience;
+        if p.is_nan() || p == f32::INFINITY {
+            0.0
+        } else if p <= 0.0 {
+            1.0
+        } else {
+            ((self.calm_time - p) / p).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Center for patrolling: the last contact while hunting, else home.
+    pub fn patrol_center(&self, now: f32) -> Vec3 {
+        match self.last_contact {
+            Some((p, t)) if now - t <= self.archetype.config.hunt_time => p,
+            _ => self.home,
+        }
+    }
+
     /// Releases tactical resources (on death / removal).
     pub fn release(&mut self) {
         self.cover = None;
@@ -243,7 +280,7 @@ impl Brain {
     }
 
     fn update_lod(&mut self, me: &ActorState, sh: &Shared) {
-        let base = self.archetype.config.think_interval;
+        let base = self.archetype.config.think_interval.max(1e-3);
         let engaged = self.under_fire > 0.0
             || self
                 .target
@@ -301,8 +338,13 @@ impl Brain {
         x.set(Input::Health, me.health_fraction());
         x.set(Input::Ammo, me.ammo_fraction());
         x.set(Input::UnderFire, self.under_fire);
-        x.set(Input::Aggression, cfg.aggression);
-        x.set(Input::Courage, cfg.courage);
+        let imp = self.impatience();
+        x.set(Input::Impatience, imp);
+        x.set(
+            Input::Aggression,
+            cfg.aggression + (1.0 - cfg.aggression) * imp,
+        );
+        x.set(Input::Courage, cfg.courage + (1.0 - cfg.courage) * imp);
         x.set(
             Input::ThreatCount,
             self.memory.confirmed_count() as f32 / 4.0,

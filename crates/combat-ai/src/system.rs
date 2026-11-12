@@ -29,6 +29,12 @@ pub struct SystemConfig {
     pub max_attackers_per_player: u8,
     /// Extra aim spread (degrees) for agents shooting without an attack token.
     pub no_token_spread_deg: f32,
+    /// Approximate radius (m) of an actor's hitbox. Only used by agents to
+    /// estimate their own chance to hit ([`crate::AgentConfig::min_hit_chance`]).
+    pub target_radius: f32,
+    /// Global multiplier on every agent's aim spread: a difficulty knob.
+    /// `1` = archetype tuning as authored, `<1` = deadlier, `>1` = sloppier.
+    pub accuracy_scale: f32,
     /// LOD distance thresholds `(full, medium)` from the nearest LOD focus point.
     /// Beyond `full` agents think 2.5x less often, beyond `medium` 6x less.
     pub lod_distances: (f32, f32),
@@ -51,6 +57,8 @@ impl Default for SystemConfig {
             grid_cell_size: 12.0,
             max_attackers_per_player: 2,
             no_token_spread_deg: 5.0,
+            accuracy_scale: 1.0,
+            target_radius: 0.3,
             lod_distances: (40.0, 90.0),
             auto_gunshot_radius: 70.0,
             sound_retention: 1.0,
@@ -121,6 +129,7 @@ pub struct AiSystem {
     claim_scratch: Vec<(u32, f32, u32)>,
     token_scratch: Vec<(u32, bool, f32, u32)>,
     sound_of: Vec<u32>,
+    sound_seq: u64,
 }
 
 impl AiSystem {
@@ -145,6 +154,7 @@ impl AiSystem {
             claim_scratch: Vec::new(),
             token_scratch: Vec::new(),
             sound_of: Vec::new(),
+            sound_seq: 0,
         }
     }
 
@@ -340,18 +350,52 @@ impl AiSystem {
 
     /// Reports a sound.
     pub fn report_sound(&mut self, event: SoundEvent) {
+        self.sound_seq += 1;
         self.sounds.push(TimedSound {
             event,
             time: self.time,
+            seq: self.sound_seq,
         });
     }
 
     /// Reports damage to an actor. AI victims react on their next tick.
     pub fn report_damage(&mut self, event: DamageEvent) {
+        // Landing a hit counts as progress for the attacker (resets impatience).
+        if let Some(b) = event
+            .attacker
+            .filter(|a| *a != event.victim)
+            .and_then(|a| self.brain_mut(a))
+        {
+            b.calm_time = 0.0;
+        }
         if let Some(b) = self.brain_mut(event.victim) {
             b.pending_damage.push(event);
             b.wake = true;
         }
+    }
+
+    /// Tells every living agent on `team` where `target` currently is, as if a
+    /// squad mate had called it out. Use it for radar pings, alarms, scripted
+    /// reveals, or a "director" that breaks stalemates. Returns the number of
+    /// agents informed (0 if `target` is unknown).
+    pub fn reveal(&mut self, target: ActorId, team: crate::ids::TeamId) -> usize {
+        let Some(t) = self.slot(target).map(|s| s.state) else {
+            return 0;
+        };
+        let mut n = 0;
+        for b in &mut self.brains {
+            let s = &self.actors[b.actor.index as usize].state;
+            if s.team != team || !s.is_alive() || b.actor == target || s.team == t.team {
+                continue;
+            }
+            if let Some(e) = b.pending_intel.iter_mut().find(|e| e.0 == target) {
+                *e = (target, t.position, t.velocity);
+            } else {
+                b.pending_intel.push((target, t.position, t.velocity));
+            }
+            n += 1;
+        }
+        n
     }
 
     // ------------------------------------------------------------------ debug
@@ -395,8 +439,12 @@ impl AiSystem {
     // ------------------------------------------------------------------ tick
 
     /// Advances the simulation by `dt` seconds and returns one command per live agent.
+    ///
+    /// A non-finite or negative `dt` is treated as `0` (the AI re-evaluates
+    /// without advancing time).
     pub fn tick<W: WorldQuery>(&mut self, dt: f32, world: &W) -> &[AgentCommand] {
         let start = Instant::now();
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
         self.time += dt;
         let now = self.time;
 
@@ -487,7 +535,9 @@ impl AiSystem {
                     continue;
                 }
                 let s = &self.actors[c.actor.index as usize].state;
+                self.sound_seq += 1;
                 let sound = TimedSound {
+                    seq: self.sound_seq,
                     event: SoundEvent {
                         position: s.position,
                         radius: self.config.auto_gunshot_radius,
@@ -577,20 +627,26 @@ impl AiSystem {
 
     fn assign_roles(&mut self, squad: &Squad) {
         // Living members with brains, in stable order.
-        let mut members: smallvec::SmallVec<[(u32, f32, f32); 16]> = Default::default();
+        // (brain, aggression, health, suppression suitability)
+        let mut members: smallvec::SmallVec<[(u32, f32, f32, f32); 16]> = Default::default();
         for &m in &squad.members {
             if let Some(slot) = self.slot(m) {
                 if slot.state.is_alive() && slot.brain != u32::MAX {
-                    let b = &self.brains[slot.brain as usize];
+                    let cfg = &self.brains[slot.brain as usize].archetype.config;
+                    // Good suppressors are cautious and have a high rate of fire
+                    // and a big magazine (a bolt-action sniper is a poor fit).
+                    let rate = (0.25 / cfg.fire_interval.max(1e-3)).min(1.0);
+                    let mag = (slot.state.mag_size as f32 / 20.0).min(1.0);
                     members.push((
                         slot.brain,
-                        b.archetype.config.aggression,
+                        cfg.aggression,
                         slot.state.health_fraction(),
+                        (1.0 - cfg.aggression) * rate * mag,
                     ));
                 }
             }
         }
-        for &(bi, _, _) in &members {
+        for &(bi, ..) in &members {
             self.brains[bi as usize].role = SquadRole::Assault;
         }
         if squad.primary.is_none() || members.len() < 2 {
@@ -607,16 +663,18 @@ impl AiSystem {
         };
         let mut by_aggr = members.clone();
         by_aggr.sort_by(|a, b| (b.1 * b.2).total_cmp(&(a.1 * a.2)).then(a.0.cmp(&b.0)));
-        for &(bi, _, h) in by_aggr.iter().take(flankers) {
+        for &(bi, _, h, _) in by_aggr.iter().take(flankers) {
             if h > 0.4 {
                 self.brains[bi as usize].role = SquadRole::Flanker;
             }
         }
-        // Suppressors: the least aggressive of the rest.
+        // Suppressors: the best suited of the rest.
         let suppressors = (n / 3).clamp(1, 3);
+        let mut by_supp = members.clone();
+        by_supp.sort_by(|a, b| b.3.total_cmp(&a.3).then(a.0.cmp(&b.0)));
         let mut assigned = 0;
-        for &(bi, _, _) in by_aggr.iter().rev() {
-            if assigned >= suppressors {
+        for &(bi, _, _, s) in by_supp.iter() {
+            if assigned >= suppressors || s <= 0.05 {
                 break;
             }
             let b = &mut self.brains[bi as usize];

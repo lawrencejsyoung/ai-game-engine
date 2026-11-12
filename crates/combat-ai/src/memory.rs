@@ -40,6 +40,8 @@ pub struct TargetMemory {
     pub searched: bool,
     /// Most recent information source.
     pub source: Source,
+    /// Only the head was in line of sight at the last check (chest occluded).
+    pub(crate) head_only: bool,
     /// Time of last line-of-sight raycast (for round-robin budgeting).
     pub(crate) los_checked: f32,
     /// Inside the view cone at the last perception update.
@@ -59,6 +61,7 @@ impl TargetMemory {
             last_damaged_us: f32::NEG_INFINITY,
             searched: false,
             source,
+            head_only: false,
             los_checked: f32::NEG_INFINITY,
             in_view: false,
         }

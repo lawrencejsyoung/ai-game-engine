@@ -41,6 +41,16 @@ pub fn band(x: f32, lo: f32, hi: f32, falloff: f32) -> f32 {
     }
 }
 
+/// 64-bit avalanche hash (SplitMix64 finalizer with a salt). Use it to derive
+/// independent seeds: `Rng::new(mix64(seed ^ k))`.
+#[inline]
+pub fn mix64(x: u64) -> u64 {
+    let mut z = x ^ 0xA076_1D64_78BD_642F;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// SplitMix64-based RNG: tiny, fast, and fully deterministic for a given seed.
 #[derive(Clone, Debug)]
 pub struct Rng(u64);

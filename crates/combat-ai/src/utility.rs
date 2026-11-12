@@ -46,6 +46,9 @@ pub enum Input {
     HasAttackToken,
     /// Seconds since the current action started / 10, clamped.
     TimeInAction,
+    /// Stand-off frustration in `[0, 1]` (see [`crate::AgentConfig::patience`]).
+    /// Already folded into `Aggression` and `Courage`; exposed for custom actions.
+    Impatience,
     /// Constant 1 (useful for baseline actions).
     One,
 }

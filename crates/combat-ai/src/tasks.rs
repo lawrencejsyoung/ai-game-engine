@@ -165,7 +165,7 @@ impl Blackboard for Ctx<'_, '_> {
             }
             Task::FindPatrolPoint => {
                 let cfg = &self.b.archetype.config;
-                let (home, radius) = (self.b.home, cfg.patrol_radius);
+                let (home, radius) = (self.b.patrol_center(now), cfg.patrol_radius);
                 match tactics::find_patrol_point(
                     self.sh,
                     me.position,
@@ -226,7 +226,17 @@ impl Blackboard for Ctx<'_, '_> {
                 i.move_to = None;
                 i.reload = false;
                 i.look = LookMode::Target;
-                if t.visible {
+                let range = self
+                    .b
+                    .archetype
+                    .config
+                    .effective_range(self.sh.config.target_radius)
+                    / self.sh.config.accuracy_scale.max(1e-3);
+                if t.visible && t.last_known_pos.distance(me.position) > range {
+                    // Can't realistically hit from here: let the tree close in.
+                    i.fire = FireMode::Hold;
+                    Status::Failure
+                } else if t.visible {
                     // Without an attack token the agent still shoots, just
                     // deliberately inaccurately (see aim.rs).
                     i.fire = FireMode::Target;
@@ -333,6 +343,17 @@ impl Blackboard for Ctx<'_, '_> {
                 i.fire = FireMode::Hold;
                 i.look = p.map_or(LookMode::Forward, LookMode::Point);
                 Status::Running
+            }
+            Task::Watch => {
+                let i = &mut self.b.intent;
+                i.move_to = None;
+                i.fire = FireMode::Hold;
+                i.look = if self.b.target.is_some() {
+                    LookMode::Target
+                } else {
+                    LookMode::Forward
+                };
+                Status::Success
             }
             Task::ClearDestination => {
                 self.b.destination = None;

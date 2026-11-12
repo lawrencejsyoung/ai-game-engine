@@ -82,6 +82,9 @@ pub enum Task {
     Bark(Bark),
     /// Stop moving and keep watching the last known threat direction. Always running.
     Hold,
+    /// Stop moving and firing and face the primary target (live position if
+    /// visible, else last known). Succeeds immediately.
+    Watch,
     /// Clear the move destination.
     ClearDestination,
 }

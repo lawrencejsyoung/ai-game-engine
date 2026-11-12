@@ -49,6 +49,9 @@ pub struct AgentCommand {
     pub aim_dir: Vec3,
     /// Point being aimed at, if aiming at something specific.
     pub aim_point: Option<Vec3>,
+    /// The actor being aimed at, if the agent is tracking a visible target.
+    /// `None` while `fire` is set means suppressive fire at a position.
+    pub aim_target: Option<ActorId>,
     /// Pull the trigger this frame (one shot). The host resolves hits along `aim_dir`.
     pub fire: bool,
     /// Begin (or continue) reloading.
@@ -69,6 +72,7 @@ impl AgentCommand {
             move_speed: MoveSpeed::Walk,
             aim_dir: forward,
             aim_point: None,
+            aim_target: None,
             fire: false,
             reload: false,
             stance: Stance::Stand,
