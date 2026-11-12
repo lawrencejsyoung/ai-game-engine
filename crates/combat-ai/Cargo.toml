@@ -1,0 +1,24 @@
+[package]
+name = "combat-ai"
+version = "0.1.0"
+description = "Engine-agnostic, high-performance AI for combative NPCs in first-person shooters"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["parallel"]
+# Run the per-agent perceive/decide/act phase on a rayon thread pool.
+parallel = ["dep:rayon"]
+
+[dependencies]
+glam = "0.29"
+smallvec = { version = "1.13", features = ["union"] }
+rayon = { version = "1.10", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "tick"
+harness = false

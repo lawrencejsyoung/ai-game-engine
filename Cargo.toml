@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/combat-ai", "crates/arena-demo"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.82"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[profile.bench]
+codegen-units = 1
+lto = "thin"

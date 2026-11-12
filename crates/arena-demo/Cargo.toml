@@ -1,0 +1,11 @@
+[package]
+name = "arena-demo"
+version = "0.1.0"
+description = "Headless arena simulation showcasing combat-ai"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+combat-ai = { path = "../combat-ai" }
