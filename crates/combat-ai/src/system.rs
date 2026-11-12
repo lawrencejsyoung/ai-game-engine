@@ -106,6 +106,8 @@ pub struct AgentDebug {
     pub has_token: bool,
     /// Number of remembered targets.
     pub known_targets: usize,
+    /// Stand-off frustration in `[0, 1]` (see [`crate::AgentConfig::patience`]).
+    pub impatience: f32,
 }
 
 /// The AI engine. See the [crate docs](crate) for the integration loop.
@@ -423,6 +425,7 @@ impl AiSystem {
             think_interval: b.think_interval,
             has_token: b.token.is_some(),
             known_targets: b.memory.entries().len(),
+            impatience: b.impatience(),
         })
     }
 

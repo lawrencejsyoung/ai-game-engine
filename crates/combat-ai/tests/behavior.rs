@@ -322,3 +322,226 @@ fn custom_archetype_with_custom_action() {
         ai.debug(b)
     );
 }
+
+#[test]
+fn reveal_tells_the_whole_team() {
+    let mut ai = AiSystem::new(cfg());
+    let p = enemy_at(&mut ai, Vec3::new(0.0, 0.0, -80.0)); // behind and out of range
+    let g1 = grunt_at(&mut ai, Vec3::ZERO, Vec3::Z);
+    let g2 = grunt_at(&mut ai, Vec3::new(5.0, 0.0, 0.0), Vec3::Z);
+    let world = BoxWorld::default();
+    run(&mut ai, &world, 0.5);
+    assert_eq!(ai.debug(g1).unwrap().target, None);
+    assert_eq!(ai.reveal(p, TeamId(1)), 2);
+    assert_eq!(
+        ai.reveal(p, TeamId(0)),
+        0,
+        "nobody on the target's own team is told"
+    );
+    run(&mut ai, &world, 0.3);
+    for g in [g1, g2] {
+        let m = ai
+            .memory(g)
+            .unwrap()
+            .get(p)
+            .copied()
+            .expect("revealed target remembered");
+        assert!(m.confirmed());
+        assert!(m.last_known_pos.distance(Vec3::new(0.0, 0.0, -80.0)) < 0.1);
+    }
+}
+
+#[test]
+fn stand_offs_make_agents_impatient_and_hits_calm_them() {
+    let mut ai = AiSystem::new(cfg());
+    // Seen once, then the enemy ducks behind a wall and stays there.
+    let p = enemy_at(&mut ai, Vec3::new(0.0, 0.0, 20.0));
+    let mut arch = (*A::sniper()).clone();
+    arch.config.patience = 3.0;
+    arch.config.memory_span = 60.0;
+    arch.actions.retain(|a| a.kind != ActionKind::Investigate);
+    let g = ai.spawn_agent(
+        ActorState::new(Vec3::ZERO, TeamId(1)).facing(Vec3::Z),
+        arch.shared(),
+    );
+    let mut world = BoxWorld::default();
+    run(&mut ai, &world, 1.0);
+    assert_eq!(ai.debug(g).unwrap().target, Some(p));
+    world
+        .boxes
+        .push((Vec3::new(-10.0, 0.0, 15.0), Vec3::new(10.0, 4.0, 16.0)));
+    ai.actor_state_mut(p).unwrap().position = Vec3::new(0.0, 0.0, 22.0);
+    run(&mut ai, &world, 2.0);
+    assert_eq!(ai.debug(g).unwrap().impatience, 0.0, "still patient");
+    run(&mut ai, &world, 5.0);
+    assert!(
+        ai.debug(g).unwrap().impatience > 0.9,
+        "{}",
+        ai.debug(g).unwrap().impatience
+    );
+    // Landing a hit resets it.
+    ai.report_damage(DamageEvent {
+        victim: p,
+        attacker: Some(g),
+        amount: 10.0,
+        origin: Vec3::ZERO,
+    });
+    ai.tick(1.0 / 30.0, &world);
+    assert_eq!(ai.debug(g).unwrap().impatience, 0.0);
+}
+
+#[test]
+fn hunts_around_the_last_contact_instead_of_going_home() {
+    let mut ai = AiSystem::new(cfg());
+    let p = enemy_at(&mut ai, Vec3::new(0.0, 0.0, 40.0));
+    let mut arch = (*A::rifleman()).clone();
+    arch.config.memory_span = 1.0;
+    arch.config.hunt_time = f32::INFINITY;
+    let patrol_r = arch.config.patrol_radius;
+    let g = ai.spawn_agent(
+        ActorState::new(Vec3::ZERO, TeamId(1)).facing(Vec3::Z),
+        arch.shared(),
+    );
+    let world = BoxWorld::default();
+    run(&mut ai, &world, 1.0);
+    assert_eq!(ai.debug(g).unwrap().target, Some(p));
+    // The enemy vanishes for good.
+    ai.remove_actor(p);
+    run(&mut ai, &world, 4.0);
+    let d = ai.debug(g).unwrap();
+    assert_eq!(d.action, ActionKind::Patrol);
+    let dest = d.destination.expect("patrolling somewhere");
+    assert!(
+        dest.distance(Vec3::new(0.0, 0.0, 40.0)) <= patrol_r + 0.1,
+        "patrols around the last contact, got {dest}"
+    );
+}
+
+#[test]
+fn sounds_reported_between_ticks_are_never_missed() {
+    // An agent that perceives every tick used to skip sounds stamped with the
+    // tick it had just perceived on.
+    let mut ai = AiSystem::new(cfg());
+    let p = enemy_at(&mut ai, Vec3::new(0.0, 0.0, -20.0));
+    let mut arch = (*A::rifleman()).clone();
+    arch.config.think_interval = 1e-4;
+    let g = ai.spawn_agent(
+        ActorState::new(Vec3::ZERO, TeamId(1)).facing(Vec3::Z),
+        arch.shared(),
+    );
+    let world = BoxWorld::with_wall(Vec3::new(-5.0, 0.0, -11.0), Vec3::new(5.0, 3.0, -10.0));
+    run(&mut ai, &world, 0.5);
+    ai.report_sound(SoundEvent {
+        position: Vec3::new(0.0, 0.0, -20.0),
+        radius: 50.0,
+        source: Some(p),
+        kind: SoundKind::Gunshot,
+    });
+    ai.tick(1.0 / 30.0, &world);
+    let aw = ai.memory(g).unwrap().get(p).map_or(0.0, |m| m.awareness);
+    assert!(aw > 0.0, "the gunshot was heard");
+}
+
+#[test]
+fn holds_fire_beyond_effective_range_and_closes_in() {
+    let mut ai = AiSystem::new(cfg());
+    enemy_at(&mut ai, Vec3::new(0.0, 0.0, 40.0));
+    let a = A::assault();
+    let range = a.config.effective_range(ai.config().target_radius);
+    assert!(
+        range < 40.0 && range > 15.0,
+        "assault effective range {range}"
+    );
+    let g = ai.spawn_agent(ActorState::new(Vec3::ZERO, TeamId(1)).facing(Vec3::Z), a);
+    let world = BoxWorld::default();
+    let mut fired_far = false;
+    let mut moved = false;
+    for _ in 0..60 {
+        ai.tick(1.0 / 30.0, &world);
+        let c = ai.commands()[0];
+        let d = ai
+            .actor_state(g)
+            .unwrap()
+            .position
+            .distance(Vec3::new(0.0, 0.0, 40.0));
+        fired_far |= c.fire && d > range;
+        moved |= c.move_to.is_some();
+        common::apply(&mut ai, 1.0 / 30.0);
+    }
+    assert!(!fired_far, "no aimed shots beyond effective range");
+    assert!(moved, "closes the distance instead");
+}
+
+#[test]
+fn returns_fire_from_cover() {
+    let mut ai = AiSystem::new(cfg());
+    let p = enemy_at(&mut ai, Vec3::new(0.0, 0.0, 20.0));
+    ai.add_cover_point(CoverPoint::new(
+        Vec3::new(0.0, 0.0, 4.0),
+        Vec3::Z,
+        CoverKind::Low,
+    ));
+    let world = BoxWorld::with_wall(Vec3::new(-1.5, 0.0, 4.6), Vec3::new(1.5, 1.1, 5.0));
+    let g = grunt_at(&mut ai, Vec3::new(0.0, 0.0, 3.0), Vec3::Z);
+    let mut cover_shots = 0;
+    let mut crouched = false;
+    for i in 0..300 {
+        if i % 30 == 0 {
+            // Keep the agent under fire so it wants cover.
+            ai.report_damage(DamageEvent {
+                victim: g,
+                attacker: Some(p),
+                amount: 1.0,
+                origin: Vec3::new(0.0, 1.5, 20.0),
+            });
+        }
+        ai.tick(1.0 / 30.0, &world);
+        let c = ai.commands()[0];
+        // At the cover point (the action label may flip between TakeCover and
+        // Engage-from-cover; what matters is ducking and shooting from there).
+        let at_cover = ai
+            .actor_state(g)
+            .unwrap()
+            .position
+            .distance(Vec3::new(0.0, 0.0, 4.0))
+            < 1.0;
+        if at_cover {
+            cover_shots += c.fire as u32;
+            crouched |= c.stance == Stance::Crouch;
+        }
+        common::apply(&mut ai, 1.0 / 30.0);
+        if let Some(s) = ai.actor_state_mut(g) {
+            s.health = 100.0;
+        }
+    }
+    assert!(crouched, "ducks behind the cover");
+    assert!(cover_shots > 0, "pops up and returns fire");
+}
+
+#[test]
+fn non_finite_dt_does_not_advance_time() {
+    let mut ai = AiSystem::new(cfg());
+    grunt_at(&mut ai, Vec3::ZERO, Vec3::Z);
+    let world = BoxWorld::default();
+    ai.tick(0.5, &world);
+    for dt in [f32::NAN, f32::INFINITY, -1.0] {
+        ai.tick(dt, &world);
+    }
+    assert_eq!(ai.time(), 0.5);
+}
+
+#[test]
+fn accuracy_scale_and_hit_chance_model() {
+    let cfg = AgentConfig::default();
+    let calm = cfg.spread_deg(1.0, 0.0, 0.0, 0.0);
+    assert_eq!(calm, cfg.accuracy_deg);
+    let stressed = cfg.spread_deg(0.0, 5.0, 4.0, 1.0);
+    assert!(stressed > calm * 2.0);
+    let near = AgentConfig::hit_chance(calm, 5.0, 0.3);
+    let far = AgentConfig::hit_chance(calm, 60.0, 0.3);
+    assert_eq!(near, 1.0);
+    assert!(far < 0.1 && far > 0.0);
+    // At the effective range the calm hit chance equals min_hit_chance.
+    let r = cfg.effective_range(0.3);
+    assert!((AgentConfig::hit_chance(calm, r, 0.3) - cfg.min_hit_chance).abs() < 1e-3);
+}

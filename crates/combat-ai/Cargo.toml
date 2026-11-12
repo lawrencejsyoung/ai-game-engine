@@ -5,6 +5,10 @@ description = "Engine-agnostic, high-performance AI for combative NPCs in first-
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+keywords = ["gamedev", "ai", "fps", "npc", "behavior-tree"]
+categories = ["game-development", "simulation"]
+readme = "../../README.md"
 
 [features]
 default = ["parallel"]

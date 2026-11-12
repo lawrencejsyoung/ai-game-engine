@@ -5,10 +5,12 @@
 //! health, ammo and pathing, feeds state/stimuli to the AI, and applies the
 //! commands it gets back.
 //!
-//! Usage: `cargo run -p arena-demo --release -- [--seed N] [--per-team N] [--quiet] [--swap-sides] [--batch N]`
+//! Usage: `cargo run -p arena-demo --release -- [--seed N] [--per-team N] [--quiet] [--swap-sides] [--batch N [--check]]`
 //!
 //! `--batch N` plays N matches (seeds `seed..seed+N`, alternating sides) and
-//! prints aggregate statistics instead of a single match log.
+//! prints aggregate statistics instead of a single match log. `--check` makes
+//! the process fail if too many matches time out or either team/side wins
+//! significantly more than half (used in CI).
 
 mod map;
 
@@ -123,6 +125,7 @@ fn main() {
     let quiet = args.iter().any(|a| a == "--quiet");
     let swap = args.iter().any(|a| a == "--swap-sides");
     let batch: u64 = arg(&args, "--batch", 0);
+    let check = args.iter().any(|a| a == "--check");
 
     if batch == 0 {
         run_match(
@@ -139,6 +142,8 @@ fn main() {
     }
 
     let mut wins = [0u32; 2];
+    // Wins by starting side (0 = left, 1 = right), to catch map/spawn bias.
+    let mut side_wins = [0u32; 2];
     let mut draws = 0;
     let mut timeouts = 0;
     let mut total_time = 0.0;
@@ -148,7 +153,11 @@ fn main() {
         let sw = swap ^ (i % 2 == 1);
         let r = run_match(s, per_team, sw, Verbosity::Silent);
         match r.winner {
-            Some(t) => wins[t as usize] += 1,
+            Some(t) => {
+                wins[t as usize] += 1;
+                // Team 0 starts on the left unless sides are swapped.
+                side_wins[((t == 0) == sw) as usize] += 1;
+            }
             None => draws += 1,
         }
         timeouts += r.timed_out as u32;
@@ -177,6 +186,7 @@ fn main() {
         100.0 * timeouts as f32 / batch as f32,
         total_time / batch as f32
     );
+    println!("by side: left {} / right {}", side_wins[0], side_wins[1]);
     let mut acc: Vec<_> = acc.into_iter().collect();
     acc.sort_by_key(|a| a.0);
     let mut total = Accuracy::default();
@@ -189,6 +199,36 @@ fn main() {
         print_accuracy(k, a);
     }
     print_accuracy("overall", &total);
+
+    if check {
+        // Regression gate for CI: few timeouts, and neither team nor side
+        // wins significantly more than half (3 sigma of a fair coin).
+        let sigma = |a: u32, b: u32| {
+            let n = (a + b).max(1) as f32;
+            (a as f32 - n / 2.0).abs() / (n.sqrt() / 2.0)
+        };
+        let mut failures = Vec::new();
+        if timeouts as f32 > batch as f32 * 0.02 {
+            failures.push(format!("{timeouts} of {batch} matches hit the time cap"));
+        }
+        if sigma(wins[0], wins[1]) > 3.0 {
+            failures.push(format!("team imbalance {} vs {}", wins[0], wins[1]));
+        }
+        if sigma(side_wins[0], side_wins[1]) > 3.0 {
+            failures.push(format!(
+                "side imbalance {} vs {}",
+                side_wins[0], side_wins[1]
+            ));
+        }
+        if failures.is_empty() {
+            println!("check passed");
+        } else {
+            for f in &failures {
+                eprintln!("check failed: {f}");
+            }
+            std::process::exit(1);
+        }
+    }
 }
 
 fn print_accuracy(name: &str, a: &Accuracy) {

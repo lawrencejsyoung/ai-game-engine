@@ -111,6 +111,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "combat-ai-ffi"
+version = "0.1.0"
+dependencies = [
+ "combat-ai",
+]
+
+[[package]]
 name = "criterion"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

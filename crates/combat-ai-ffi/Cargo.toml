@@ -1,0 +1,20 @@
+[package]
+name = "combat-ai-ffi"
+version = "0.1.0"
+description = "C ABI for combat-ai, for embedding in C/C++ engines (Unreal, Unity native plugins, custom engines)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "combat_ai_ffi"
+# staticlib/cdylib for C/C++ hosts; rlib so the Rust tests can call the C ABI directly.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["parallel"]
+parallel = ["combat-ai/parallel"]
+
+[dependencies]
+combat-ai = { path = "../combat-ai", default-features = false }
